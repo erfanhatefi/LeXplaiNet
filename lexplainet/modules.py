@@ -1,6 +1,19 @@
 import torch
 
 
+# Used mostly in canonizing the element-wise sum
+# Exmaples: summation of residual streams
+#  in a ResNet or Transformer block
+class ElementwiseSum(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @staticmethod
+    def forward(x):  # from X=torch.stack([X0, X1], dim=0)
+        assert x.shape[0] == 2
+        return torch.sum(x, dim=0)
+
+
 class posnegconv(torch.nn.Module):
     """
     Implementation of the PosNegConv layer
