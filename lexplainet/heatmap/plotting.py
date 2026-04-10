@@ -39,7 +39,7 @@ def plot_heatmap_zennit(relevance):
     plt.tight_layout()
 
 
-def plot_heatmap(relevance, q=100):
+def plot_heatmap(relevance, q=100, show=True):
     # if relevance has extra dimension, remove it
     if len(relevance.shape) == 4:
         heatmap = relevance.sum(dim=(0, 1))  # sum over channels
@@ -51,6 +51,14 @@ def plot_heatmap(relevance, q=100):
     clim = np.percentile(np.abs(heatmap), q)
 
     heatmap = heatmap / clim
+
+    if show == False:
+        return heatmap, clim
+    else:
+        show_heatmap(heatmap, clim)
+
+
+def show_heatmap(heatmap, clim):
     plt.imshow(heatmap, cmap="seismic", clim=(-clim, clim))
     plt.axis("off")
 
