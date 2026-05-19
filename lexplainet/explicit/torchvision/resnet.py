@@ -1,11 +1,10 @@
 import torch
 import copy
 
-import lexplainet.modules as modules
-from lexplainet.wrapper import get_rule_wrapper_by_module
+import lexplainet.explicit.modules as modules
+from lexplainet.explicit.wrapper import get_rule_wrapper_by_module
 
 from torchvision.models.resnet import BasicBlock, Bottleneck, ResNet
-
 
 """
 Fused components for ResNet
