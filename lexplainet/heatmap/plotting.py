@@ -3,7 +3,7 @@ import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
 from .zennit_image import imgify
-from lexplainet.explicit.torchvision import transforms
+from torchvision import transforms
 
 
 def generate_heatmap(
@@ -39,7 +39,7 @@ def plot_heatmap_zennit(relevance):
     plt.tight_layout()
 
 
-def plot_heatmap(relevance, q=100, show=True):
+def plot_heatmap(relevance, q=100, show=True, save=False, save_path="heatmap.png"):
     # if relevance has extra dimension, remove it
     if len(relevance.shape) == 4:
         heatmap = relevance.sum(dim=(0, 1))  # sum over channels
@@ -52,6 +52,8 @@ def plot_heatmap(relevance, q=100, show=True):
 
     heatmap = heatmap / clim
 
+    if save:
+        plt.imsave(save_path, heatmap, cmap="seismic", vmin=-1, vmax=1)
     if show == False:
         return heatmap, clim
     else:
