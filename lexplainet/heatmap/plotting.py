@@ -3,7 +3,7 @@ import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
 from .zennit_image import imgify
-from torchvision import transforms
+from lexplainet.explicit.torchvision import transforms
 
 
 def generate_heatmap(
