@@ -1,5 +1,5 @@
 import torch
-from .core import check_already_patched
+from .composite_core import check_already_patched
 from .rules import uniform_gradient_division_rule
 
 """
@@ -157,30 +157,36 @@ def layer_norm_forward(self, x):
 
 
 def canonize_conv2d_batchnorm(
-    conv2d_module: torch.nn.Conv2d, batchnorm_module: torch.nn.BatchNorm2d
+    conv2d_module: torch.nn.Module,
+    batchnorm_module: torch.nn.modules.batchnorm._BatchNorm,
 ):
     """
-    Thie function canonizes the Conv2d and its following BatchNorm2d layers by merging
-    the parameters of the BatchNorm2d layer into the Conv2d layer.
+    Thie function canonizes a Conv2d/Linear layer and its following BatchNorm layer by
+    merging the parameters of the BatchNorm layer into the preceding linear layer.
 
     For further information, check this paper: Pahde, Frederik, et al. "Optimizing explanations
     by network canonization and hyperparameter search." Proceedings of the IEEE/CVF Conference
     on Computer Vision and Pattern Recognition. 2023.
 
     Args:
-        conv2d_module (torch.nn.Conv2d): The Conv2d module to be canonized.
-        batchnorm_module (torch.nn.BatchNorm2d): The BatchNorm2d module to be canonized.
+        conv2d_module (torch.nn.Module): Conv2d or Linear module to be canonized.
+        batchnorm_module (torch.nn.modules.batchnorm._BatchNorm): BatchNorm module to be canonized.
     Returns:
-        None: The function modifies the conv2d_module in-place by merging the parameters of the batchnorm_module into it.
+        None: The function modifies conv2d_module in-place by merging the parameters of batchnorm_module into it.
     """
+    if not isinstance(conv2d_module, (torch.nn.Conv2d, torch.nn.Linear)):
+        raise TypeError(
+            f"Expected Conv2d or Linear for merge, got {type(conv2d_module).__name__}."
+        )
+
     w_bn = batchnorm_module.weight
     b_bn = batchnorm_module.bias
     s = torch.sqrt(batchnorm_module.running_var + batchnorm_module.eps)
     m = batchnorm_module.running_mean
 
-    conv2d_module.weight = torch.nn.Parameter(
-        conv2d_module.weight * (w_bn / s).view(-1, 1, 1, 1)
-    )
+    scale = (w_bn / s).view(-1, *([1] * (conv2d_module.weight.ndim - 1)))
+
+    conv2d_module.weight = torch.nn.Parameter(conv2d_module.weight * scale)
     if conv2d_module.bias is not None:
         conv2d_module.bias = torch.nn.Parameter(
             (conv2d_module.bias - m) * (w_bn / s) + b_bn
@@ -189,20 +195,25 @@ def canonize_conv2d_batchnorm(
         conv2d_module.bias = torch.nn.Parameter((-m) * (w_bn / s) + b_bn)
 
 
-def neutralize_batchnorm(batchnorm_module: torch.nn.BatchNorm2d):
+def neutralize_batchnorm(batchnorm_module: torch.nn.modules.batchnorm._BatchNorm):
     """
-    Neutralize the BatchNorm2d module by setting its weight to 1, bias to 0,
+    Neutralize the BatchNorm module by setting its weight to 1, bias to 0,
     running mean to 0, and running variance to 1.
 
     Args:
-        batchnorm_module (torch.nn.BatchNorm2d): The BatchNorm2d module to
+        batchnorm_module (torch.nn.modules.batchnorm._BatchNorm): The BatchNorm module to
     """
-    batchnorm_module.weight = torch.nn.Parameter(
-        torch.ones_like(batchnorm_module.weight)
-    )
-    batchnorm_module.bias = torch.nn.Parameter(torch.zeros_like(batchnorm_module.bias))
+    if batchnorm_module.weight is not None:
+        batchnorm_module.weight = torch.nn.Parameter(
+            torch.ones_like(batchnorm_module.weight)
+        )
+    if batchnorm_module.bias is not None:
+        batchnorm_module.bias = torch.nn.Parameter(
+            torch.zeros_like(batchnorm_module.bias)
+        )
     batchnorm_module.running_mean = torch.zeros_like(batchnorm_module.running_mean)
     batchnorm_module.running_var = torch.ones_like(batchnorm_module.running_var)
+    batchnorm_module.eps = 0.0
 
 
 def merge_conv2d_batchnorm(model: torch.nn.Module):
@@ -214,14 +225,88 @@ def merge_conv2d_batchnorm(model: torch.nn.Module):
     Args:
         model (torch.nn.Module): The model whose Conv2d and BatchNorm2d layers
     """
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Conv2d):
-            next_name = name.rsplit(".", 1)[0]
-            next_module = dict(model.named_modules()).get(next_name)
-            if isinstance(next_module, torch.nn.BatchNorm2d):
-                canonize_conv2d_batchnorm(module, next_module)
-                neutralize_batchnorm(next_module)
-                print(f"Canonize Conv2d and BatchNorm2d layers: {name} and {next_name}")
+
+    def collect_leaves(module):
+        """Depth-first, in-order leaf traversal (same adjacency logic as Zennit)."""
+        is_leaf = True
+        for child in module.children():
+            is_leaf = False
+            yield from collect_leaves(child)
+        if is_leaf:
+            yield module
+
+    def is_linear_leaf(module):
+        # In this project we treat Conv2d and Linear as the mergeable linear layers.
+        return isinstance(module, (torch.nn.Conv2d, torch.nn.Linear))
+
+    def is_batchnorm_leaf(module):
+        return isinstance(
+            module,
+            (
+                torch.nn.BatchNorm1d,
+                torch.nn.BatchNorm2d,
+                torch.nn.BatchNorm3d,
+            ),
+        )
+
+    module_to_name = {id(module): name for name, module in model.named_modules()}
+
+    last_leaf = None
+    for leaf in collect_leaves(model):
+        if is_linear_leaf(last_leaf) and is_batchnorm_leaf(leaf):
+            canonize_conv2d_batchnorm(last_leaf, leaf)
+            neutralize_batchnorm(leaf)
+            print(
+                "Canonize linear and BatchNorm layers: "
+                f"{module_to_name.get(id(last_leaf), '<unnamed>')} and {module_to_name.get(id(leaf), '<unnamed>')}"
+            )
+        last_leaf = leaf
+
+    # Old version 1 (name-based lookup, kept for reference)
+    # for name, module in model.named_modules():
+    #     if isinstance(module, torch.nn.Conv2d):
+    #         next_name = name.rsplit(".", 1)[0]
+    #         next_module = dict(model.named_modules()).get(next_name)
+    #         if isinstance(next_module, torch.nn.BatchNorm2d):
+    #             canonize_conv2d_batchnorm(module, next_module)
+    #             neutralize_batchnorm(next_module)
+    #             print(f"Canonize Conv2d and BatchNorm2d layers: {name} and {next_name}")
+
+    # Old version 2 (adjacent-module indexing, kept for reference)
+    # modules = list(model.named_modules())
+    # for idx, (name, module) in enumerate(modules[:-1]):
+    #     if not isinstance(module, torch.nn.Conv2d):
+    #         continue
+    #     next_name, next_module = modules[idx + 1]
+    #     if isinstance(next_module, torch.nn.BatchNorm2d):
+    #         canonize_conv2d_batchnorm(module, next_module)
+    #         neutralize_batchnorm(next_module)
+    #         print(f"Canonize Conv2d and BatchNorm2d layers: {name} and {next_name}")
+
+    # Old version 3 (last-seen Conv2d in named_modules traversal, kept for reference)
+    # last_conv_name = None
+    # last_conv_module = None
+    # for name, module in model.named_modules():
+    #     if isinstance(module, torch.nn.Conv2d):
+    #         last_conv_name = name
+    #         last_conv_module = module
+    #         continue
+    #     if isinstance(module, torch.nn.BatchNorm2d) and last_conv_module is not None:
+    #         canonize_conv2d_batchnorm(last_conv_module, module)
+    #         neutralize_batchnorm(module)
+    #         print(f"Canonize Conv2d and BatchNorm2d layers: {last_conv_name} and {name}")
+    #         last_conv_name = None
+    #         last_conv_module = None
+
+
+def canonize_vgg_bn(model: torch.nn.Module):
+    """
+    Canonize the VGG-BN model by merging its Conv2d and following BatchNorm2d layers.
+
+    Args:
+        model (torch.nn.Module): The ResNet model to be canonized.
+    """
+    merge_conv2d_batchnorm(model)
 
 
 def canonize_resnet(model: torch.nn.Module):
