@@ -1,5 +1,10 @@
 import torch
-from .utils import stabilize, apply_operation
+from .rule_utils import (
+    apply_linear_operation,
+    preserve_forward_with_modified_gradient,
+    _positive_bias,
+    _negative_bias,
+)
 
 
 def epsilon_rule(self, x):
@@ -20,7 +25,7 @@ def epsilon_rule(self, x):
         torch.Tensor: The output tensor resulting from applying the operation with the provided weights.
     """
     w = self.weight
-    z = apply_operation(self, x, w)
+    z = apply_linear_operation(self, x, w)
     return z
 
 
@@ -43,11 +48,13 @@ def zplus_rule(self, x):
     pos_w, neg_w = torch.clamp(w, min=0), torch.clamp(w, max=0)
 
     def z_pos(x):
-        vp = apply_operation(self, torch.clamp(x, min=0), pos_w)
-        vn = apply_operation(self, torch.clamp(x, max=0), neg_w)
+        vp = apply_linear_operation(
+            self, torch.clamp(x, min=0), pos_w, bias=_positive_bias(self)
+        )
+        vn = apply_linear_operation(self, torch.clamp(x, max=0), neg_w, bias=None)
         return vp + vn
 
-    z_hat = z_pos(x) * (self.old_forward(x) / stabilize(z_pos(x))).detach()
+    z_hat = preserve_forward_with_modified_gradient(self.old_forward(x), z_pos(x))
 
     return z_hat
 
@@ -73,19 +80,22 @@ def alphabeta_rule(self, x, alpha, beta):
     pos_w, neg_w = torch.clamp(w, min=0), torch.clamp(w, max=0)
 
     def z_pos(x):
-        vp = apply_operation(self, torch.clamp(x, min=0), pos_w)
-        vn = apply_operation(self, torch.clamp(x, max=0), neg_w)
+        vp = apply_linear_operation(
+            self, torch.clamp(x, min=0), pos_w, bias=_positive_bias(self)
+        )
+        vn = apply_linear_operation(self, torch.clamp(x, max=0), neg_w, bias=None)
         return vp + vn
 
     def z_neg(x):
-        vp = apply_operation(self, torch.clamp(x, max=0), pos_w)
-        vn = apply_operation(self, torch.clamp(x, min=0), neg_w)
+        vp = apply_linear_operation(
+            self, torch.clamp(x, max=0), pos_w, bias=_negative_bias(self)
+        )
+        vn = apply_linear_operation(self, torch.clamp(x, min=0), neg_w, bias=None)
         return vp + vn
 
-    z_hat = (
-        alpha * z_pos(x) * (self.old_forward(x) / stabilize(z_pos(x))).detach()
-        + beta * z_neg(x) * (self.old_forward(x) / stabilize(z_neg(x))).detach()
-    )
+    z_hat = alpha * preserve_forward_with_modified_gradient(
+        self.old_forward(x), z_pos(x)
+    ) + beta * preserve_forward_with_modified_gradient(self.old_forward(x), z_neg(x))
     return z_hat
 
 
@@ -108,11 +118,11 @@ def gamma_rule(self, x, gamma):
     pos_w, neg_w = torch.clamp(w, min=0), torch.clamp(w, max=0)
 
     def z_tilde(x):
-        vp = apply_operation(self, torch.clamp(x, min=0), pos_w)
-        vn = apply_operation(self, torch.clamp(x, max=0), neg_w)
-        return apply_operation(self, x, w) + (vp + vn) * gamma
+        vp = apply_linear_operation(self, torch.clamp(x, min=0), pos_w, bias=None)
+        vn = apply_linear_operation(self, torch.clamp(x, max=0), neg_w, bias=None)
+        return apply_linear_operation(self, x, w) + (vp + vn) * gamma
 
-    z_hat = z_tilde(x) * (self.old_forward(x) / stabilize(z_tilde(x))).detach()
+    z_hat = preserve_forward_with_modified_gradient(self.old_forward(x), z_tilde(x))
     return z_hat
 
 
@@ -137,11 +147,11 @@ def inverse_gamma_rule(self, x, gamma):
     pos_w, neg_w = torch.clamp(w, min=0), torch.clamp(w, max=0)
 
     def z_tilde(x):
-        vp = apply_operation(self, torch.clamp(x, min=0), pos_w)
-        vn = apply_operation(self, torch.clamp(x, max=0), neg_w)
-        return apply_operation(self, x, w) / gamma + (vp + vn)
+        vp = apply_linear_operation(self, torch.clamp(x, min=0), pos_w, bias=None)
+        vn = apply_linear_operation(self, torch.clamp(x, max=0), neg_w, bias=None)
+        return apply_linear_operation(self, x, w) / gamma + (vp + vn)
 
-    z_hat = z_tilde(x) * (self.old_forward(x) / stabilize(z_tilde(x))).detach()
+    z_hat = preserve_forward_with_modified_gradient(self.old_forward(x), z_tilde(x))
     return z_hat
 
 
@@ -165,10 +175,10 @@ def lifted_gamma_rule(self, x, gamma):
     pos_w, neg_w = torch.clamp(w, min=0), torch.clamp(w, max=0)
 
     def z_tilde(x):
-        vp = apply_operation(self, torch.clamp(x, min=0), pos_w)
-        vn = apply_operation(self, torch.clamp(x, max=0), neg_w)
+        vp = apply_linear_operation(self, torch.clamp(x, min=0), pos_w, bias=None)
+        vn = apply_linear_operation(self, torch.clamp(x, max=0), neg_w, bias=None)
         positive_contribution = vp + vn
-        u = apply_operation(self, x, w)
+        u = apply_linear_operation(self, x, w)
 
         eps_threshold = 1e-10
         vpstab = torch.where(
@@ -177,9 +187,9 @@ def lifted_gamma_rule(self, x, gamma):
         mingamma = (1.0 - u / vpstab) ** 2
         lifted_gamma = torch.clamp(mingamma, max=gamma)
 
-        return (u / lifted_gamma) + positive_contribution
+        return u + (positive_contribution * lifted_gamma)
 
-    z_hat = z_tilde(x) * (self.old_forward(x) / stabilize(z_tilde(x))).detach()
+    z_hat = preserve_forward_with_modified_gradient(self.old_forward(x), z_tilde(x))
     return z_hat
 
 
@@ -235,7 +245,7 @@ def identity_rule(self, x):
     Returns:
         torch.Tensor: The output tensor resulting from applying the identity rule.
     """
-    return x * (self.old_forward(x) / stabilize(x)).detach()
+    return preserve_forward_with_modified_gradient(self.old_forward(x), x)
 
 
 def dropout_rule(self, x):
