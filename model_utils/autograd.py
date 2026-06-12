@@ -69,6 +69,7 @@ def compute_relevance(
     target=None,
     init_relevance="logit",
     normalize=False,
+    tuple_output_index=0,
 ):
 
     if input_tensor.grad is not None:
@@ -76,10 +77,18 @@ def compute_relevance(
     input_tensor.requires_grad = True
 
     output = forward_pass(model, input_tensor, gradient_required=True)
+    # if output is a tuple, take the given element out
+    # if not isinstance(output, tuple):
+    #     output = output[tuple_output_index]
 
     if targeted:
         if target is None:
-            targeted_index = output.argmax(dim=1)
+            # first check if the shape of output is compatible with argmax
+            # targeted_index = output.argmax(dim=1)
+            if output.ndim == 1:
+                targeted_index = output.argmax()
+            elif output.ndim == 2:
+                targeted_index = output.argmax(dim=1)
             gradient_output = make_gradient_output(output, targeted_index)
         else:
             targeted_index = target
