@@ -69,7 +69,6 @@ def wrap_attention_forward(forward_fn: callable):
         query = uniform_gradient_division_rule(query, 4)
         key = uniform_gradient_division_rule(key, 4)
         value = uniform_gradient_division_rule(value, 2)
-
         if "dropout" in kwargs:
             kwargs["dropout"] = 0.0
         return forward_fn(module, query, key, value, *args, **kwargs)
@@ -138,7 +137,6 @@ def layer_norm_forward(self, x):
         Propagation for Transformers." Proceedings of the 41st International
         Conference on Machine Learning (2024).
     """
-
     mean = x.mean(dim=-1, keepdim=True)
     var = ((x - mean) ** 2).mean(dim=-1, keepdim=True)
     std = (var + self.eps).sqrt()
@@ -317,3 +315,60 @@ def canonize_resnet(model: torch.nn.Module):
         model (torch.nn.Module): The ResNet model to be canonized.
     """
     merge_conv2d_batchnorm(model)
+
+
+def canonize_efficientnet(model: torch.nn.Module):
+    """
+    Canonize the EfficientNet model by merging its Conv2d and following BatchNorm2d layers.
+
+    Args:
+        model (torch.nn.Module): The EfficientNet model to be canonized.
+    """
+    merge_conv2d_batchnorm(model)
+
+
+
+def se_block_gate_forward(self, input):
+    """
+    For EfficientNet, we need to patch the forward function of the gate in the Squeeze-and-Excitation
+    block to apply the uniform rule on the element-wise multiplication via the Gradient*Input framework.
+    This is because the gate in the Squeeze-and-Excitation block is an element-wise multiplication operation,
+    and we want to ensure that the relevance scores are correctly propagated through this operation according
+    to the uniform rule.
+    
+    Block forward function for the gate in the Squeeze-and-Excitation block.
+    We apply the identity rule on the activation function later when we identify
+    it in the composite before patching takes place, and here we apply the uniform 
+    rule on the element-wise multiplication via the Gradient*Input framework.
+
+    Args:
+        self (torch.nn.Module): The Squeeze-and-Excitation block module whose forward method is to be patched.
+        input (torch.Tensor): The input tensor to the Squeeze-and-Excitation block module.
+    Returns:
+        torch.Tensor: The output tensor resulting from applying the block forward pass with the uniform rule on
+    """
+    scale = self._scale(input).detach()
+    return scale * input
+
+def se_uniform_product_forward(self, input):
+    """
+    For EfficientNet, we need to patch the forward function of the
+    gate in the Squeeze-and-Excitation block to apply the uniform rule 
+    on the element-wise multiplication via the Gradient*Input framework. 
+    This is because the gate in the Squeeze-and-Excitation block is an element-wise 
+    multiplication operation, and we want to ensure that the relevance scores are correctly 
+    propagated through this operation according to the uniform rule.
+
+    Uniform product forward function for the Squeeze-and-Excitation block.
+    We apply the uniform rule on the element-wise multiplication via the Gradient*Input framework.
+
+    Args:
+        self (torch.nn.Module): The Squeeze-and-Excitation block module whose forward method is to be patched.
+        input (torch.Tensor): The input tensor to the Squeeze-and-Excitation block module.
+    Returns:
+        torch.Tensor: The output tensor resulting from applying the block forward pass with the uniform rule on
+    """
+    scale = self._scale(input)
+    scale = uniform_gradient_division_rule(scale, 2)
+    input = uniform_gradient_division_rule(input, 2)
+    return scale * input
