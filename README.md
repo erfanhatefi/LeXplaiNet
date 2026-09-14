@@ -92,7 +92,7 @@ canonize_resnet(model)
 composite = {
     torch.nn.Conv2d: (zplus_rule, {"ignore_bias": True}),
     torch.nn.Linear: (
-        epsilon_rule_non_zero,
+        epsilon_rule,
         {"epsilon": 1e-6, "ignore_bias": True},
     ),
     torch.nn.ReLU: (identity_rule, {}),
