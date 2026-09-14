@@ -101,3 +101,34 @@ def patch_composite(model: torch.nn.Module, composite_name: dict, log=False):
                     f"Patching Layer: {type(module)} with Rule: {rule.__name__} and kwargs: {kwargs}"
                 )
             patch_module_forward(module, rule, **kwargs)
+
+
+def patch_specific_modules(specific_composite, log=True):
+    """
+    Patch specific module objects directly.
+
+    specific_composite example:
+        {
+            model.classifier: (epsilon_rule, {"ignore_bias": True}),
+            model.dinov2.encoder.layer[11].mlp.fc2: (
+                gamma_rule,
+                {"gamma": 0.25, "ignore_bias": True},
+            ),
+        }
+    """
+    patched_modules = []
+
+    for module, rule_config in specific_composite.items():
+        rule, kwargs = rule_config
+
+        # If the global composite already patched this module,
+        # restore its original forward first, then apply the specific rule.
+        undo_patch(module)
+        patch_module_forward(module, rule, **kwargs)
+
+        patched_modules.append(module)
+
+        if log:
+            print(f"Specific patch: {module.__class__.__name__} -> {rule.__name__}, {kwargs}")
+
+    return patched_modules
