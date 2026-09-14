@@ -7,7 +7,7 @@ from .rule_utils import (
 )
 
 
-def epsilon_rule(self, x):
+def epsilon_rule(self, x, ignore_bias=False):
     """
     Implicit implementation of LRP-Epsilon(zero) rule for Linear and Conv2d layers.
     Given the higher level relevances computed by GxI framework, the implicit LRP-Epsilon zero
@@ -17,6 +17,10 @@ def epsilon_rule(self, x):
     Check this paper for further information: Arras, Leila, et al. "A close look at decomposition-based XAI-methods
     for transformer language models." arXiv preprint arXiv:2502.15886 (2025).
 
+    It is suggested (but have to check it on your own) to not ignore (flag=False) of lieanr layers
+    everywhere, and ignore the conv2d (flag=True)
+    Reason probably: Linear layers, especially after LayerNorm or near the classifier, can have meaningful bias terms.
+
     Args:
         self (torch.nn.Module): The layer (Linear or Conv2d) on which the
         x (torch.Tensor): The input tensor to the layer.
@@ -25,11 +29,16 @@ def epsilon_rule(self, x):
         torch.Tensor: The output tensor resulting from applying the operation with the provided weights.
     """
     w = self.weight
-    z = apply_linear_operation(self, x, w)
-    return z
+
+    if ignore_bias:
+        original_output = self.old_forward(x)
+        z_proxy = apply_linear_operation(self, x, w, bias=None)
+        return preserve_forward_with_modified_gradient(original_output, z_proxy)
+
+    return apply_linear_operation(self, x, w)
 
 
-def zplus_rule(self, x):
+def zplus_rule(self, x, ignore_bias=True):
     """
     Implicit implementation of LRP-ZPlus (or Alpha1-Beta0) rule for Linear and Conv2d layers.
     This can be computed in implicit way using $\hat z_j = z_j^{pos} [\frac{z_j}{z_j^{pos}}]_\texttt{.detach()}$
@@ -47,11 +56,12 @@ def zplus_rule(self, x):
     w = self.weight
     pos_w, neg_w = torch.clamp(w, min=0), torch.clamp(w, max=0)
 
+    pos_bias = None if ignore_bias else _positive_bias(self)
+    neg_bias = None if ignore_bias else _negative_bias(self)
+
     def z_pos(x):
-        vp = apply_linear_operation(
-            self, torch.clamp(x, min=0), pos_w, bias=_positive_bias(self)
-        )
-        vn = apply_linear_operation(self, torch.clamp(x, max=0), neg_w, bias=None)
+        vp = apply_linear_operation(self, torch.clamp(x, min=0), pos_w, bias=pos_bias)
+        vn = apply_linear_operation(self, torch.clamp(x, max=0), neg_w, bias=neg_bias)
         return vp + vn
 
     z_hat = preserve_forward_with_modified_gradient(self.old_forward(x), z_pos(x))
@@ -59,7 +69,7 @@ def zplus_rule(self, x):
     return z_hat
 
 
-def alphabeta_rule(self, x, alpha, beta):
+def alphabeta_rule(self, x, alpha, beta, ignore_bias=True):
     """
     Implicit implementation of LRP-AlphaBeta rule for Linear and Conv2d layers.
     This can be computed in implicit way using $\hat z_j = \alpha \cdot z_j^{pos}
@@ -76,21 +86,22 @@ def alphabeta_rule(self, x, alpha, beta):
     Returns:
         torch.Tensor: The output tensor resulting from applying the operation with the provided weights.
     """
+    assert alpha + beta == 1, "alpha - beta must be equal to 1"
+
     w = self.weight
     pos_w, neg_w = torch.clamp(w, min=0), torch.clamp(w, max=0)
 
+    pos_bias = None if ignore_bias else _positive_bias(self)
+    neg_bias = None if ignore_bias else _negative_bias(self)
+
     def z_pos(x):
-        vp = apply_linear_operation(
-            self, torch.clamp(x, min=0), pos_w, bias=_positive_bias(self)
-        )
-        vn = apply_linear_operation(self, torch.clamp(x, max=0), neg_w, bias=None)
+        vp = apply_linear_operation(self, torch.clamp(x, min=0), pos_w, bias=pos_bias)
+        vn = apply_linear_operation(self, torch.clamp(x, max=0), neg_w, bias=neg_bias)
         return vp + vn
 
     def z_neg(x):
-        vp = apply_linear_operation(
-            self, torch.clamp(x, max=0), pos_w, bias=_negative_bias(self)
-        )
-        vn = apply_linear_operation(self, torch.clamp(x, min=0), neg_w, bias=None)
+        vp = apply_linear_operation(self, torch.clamp(x, max=0), pos_w, bias=pos_bias)
+        vn = apply_linear_operation(self, torch.clamp(x, min=0), neg_w, bias=neg_bias)
         return vp + vn
 
     z_hat = alpha * preserve_forward_with_modified_gradient(
@@ -99,7 +110,7 @@ def alphabeta_rule(self, x, alpha, beta):
     return z_hat
 
 
-def gamma_rule(self, x, gamma):
+def gamma_rule(self, x, gamma, ignore_bias=True):
     """
     Implicit implementation of LRP-Gamma rule for Linear and Conv2d layers.
     This can be computed in implicit way using $\hat z_j = \tilde z_j
@@ -117,16 +128,20 @@ def gamma_rule(self, x, gamma):
     w = self.weight
     pos_w, neg_w = torch.clamp(w, min=0), torch.clamp(w, max=0)
 
+    bias = None if ignore_bias else self.bias
+    pos_bias = None if ignore_bias else _positive_bias(self)
+    neg_bias = None if ignore_bias else _negative_bias(self)
+
     def z_tilde(x):
-        vp = apply_linear_operation(self, torch.clamp(x, min=0), pos_w, bias=None)
-        vn = apply_linear_operation(self, torch.clamp(x, max=0), neg_w, bias=None)
-        return apply_linear_operation(self, x, w) + (vp + vn) * gamma
+        vp = apply_linear_operation(self, torch.clamp(x, min=0), pos_w, bias=pos_bias)
+        vn = apply_linear_operation(self, torch.clamp(x, max=0), neg_w, bias=neg_bias)
+        return apply_linear_operation(self, x, w, bias=bias) + (vp + vn) * gamma
 
     z_hat = preserve_forward_with_modified_gradient(self.old_forward(x), z_tilde(x))
     return z_hat
 
 
-def inverse_gamma_rule(self, x, gamma):
+def inverse_gamma_rule(self, x, gamma, ignore_bias=True):
     """
     Implicit implementation of LRP-Gamma rule for Linear and Conv2d layers.
     It is the same as the "gamma_rule" but with the gamma parameter being
@@ -146,16 +161,20 @@ def inverse_gamma_rule(self, x, gamma):
     w = self.weight
     pos_w, neg_w = torch.clamp(w, min=0), torch.clamp(w, max=0)
 
+    bias = None if ignore_bias else self.bias
+    pos_bias = None if ignore_bias else _positive_bias(self)
+    neg_bias = None if ignore_bias else _negative_bias(self)
+
     def z_tilde(x):
-        vp = apply_linear_operation(self, torch.clamp(x, min=0), pos_w, bias=None)
-        vn = apply_linear_operation(self, torch.clamp(x, max=0), neg_w, bias=None)
-        return apply_linear_operation(self, x, w) / gamma + (vp + vn)
+        vp = apply_linear_operation(self, torch.clamp(x, min=0), pos_w, bias=pos_bias)
+        vn = apply_linear_operation(self, torch.clamp(x, max=0), neg_w, bias=neg_bias)
+        return apply_linear_operation(self, x, w, bias=bias) / gamma + (vp + vn)
 
     z_hat = preserve_forward_with_modified_gradient(self.old_forward(x), z_tilde(x))
     return z_hat
 
 
-def lifted_gamma_rule(self, x, gamma):
+def lifted_gamma_rule(self, x, gamma, ignore_bias=True):
     """
     Lifted gamma is an upgraded version of the gamma rule, where we lift the gamma
     parameter to a higher value while ensuring that the relevance scores do not
@@ -174,23 +193,40 @@ def lifted_gamma_rule(self, x, gamma):
     w = self.weight
     pos_w, neg_w = torch.clamp(w, min=0), torch.clamp(w, max=0)
 
+    bias = None if ignore_bias else self.bias
+    pos_bias = None if ignore_bias else _positive_bias(self)
+    neg_bias = None if ignore_bias else _negative_bias(self)
+
     def z_tilde(x):
-        vp = apply_linear_operation(self, torch.clamp(x, min=0), pos_w, bias=None)
-        vn = apply_linear_operation(self, torch.clamp(x, max=0), neg_w, bias=None)
-        positive_contribution = vp + vn
-        u = apply_linear_operation(self, x, w)
+        vp = apply_linear_operation(self, torch.clamp(x, min=0), pos_w, bias=pos_bias)
+        vn = apply_linear_operation(self, torch.clamp(x, max=0), neg_w, bias=neg_bias)
+        pos_contr = vp + vn
+        u = apply_linear_operation(self, x, w, bias=bias)
 
-        eps_threshold = 1e-10
-        vpstab = torch.where(
-            positive_contribution > eps_threshold, positive_contribution, eps_threshold
+        epsthresh = 1e-10
+        pstab = torch.where(
+            pos_contr > epsthresh, pos_contr, torch.full_like(pos_contr, epsthresh)
         )
-        mingamma = (1.0 - u / vpstab) ** 2
-        lifted_gamma = torch.clamp(mingamma, max=gamma)
+        min_gamma = (1.0 - u / pstab) ** 2
+        gamma_eff = torch.maximum(
+            torch.as_tensor(gamma, device=x.device, dtype=x.dtype), min_gamma
+        )
 
-        return u + (positive_contribution * lifted_gamma)
+        return pos_contr + u / gamma_eff
 
     z_hat = preserve_forward_with_modified_gradient(self.old_forward(x), z_tilde(x))
     return z_hat
+
+
+class DivideGradient(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, factor):
+        ctx.factor = factor
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output / ctx.factor, None
 
 
 def uniform_gradient_division_rule(x, detached_factor=2):
@@ -209,9 +245,14 @@ def uniform_gradient_division_rule(x, detached_factor=2):
     Returns:
         torch.Tensor: The output tensor resulting from applying the uniform gradient division rule.
     """
-    fraction = 1 / detached_factor
-    z_hat = x * fraction + (x * (1 - fraction)).detach()
-    return z_hat
+    # fraction = 1 / detached_factor
+    # z_hat = x * fraction + (x * (1 - fraction)).detach()
+    # return z_hat
+    # Alternative Approach which is more efficient and does not
+    # require any additional memory allocation for the detached tensor.
+    # the main benefit is in the numerical error causes by multiplying
+    # and adding the detached tensor, which can be avoided by using this approach.
+    return DivideGradient.apply(x, detached_factor)
 
 
 def block_rule(self, x):
