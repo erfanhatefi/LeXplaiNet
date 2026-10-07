@@ -4,7 +4,7 @@ The module provides three complementary renderers:
 
 - ``latex_heatmap`` / ``pdf_heatmap`` for publication-style PDF output.
 - ``plot_text_heatmap`` for static Matplotlib figures that can be saved as PNG.
-- ``interactive_text_heatmap`` for optional Plotly hover labels.
+- ``interactive_text_heatmap`` for hoverable Plotly figures in notebooks.
 """
 
 from __future__ import annotations
@@ -31,36 +31,9 @@ _NO_SPACE_BEFORE = set(",.!?:;%)]}\u201d\u2019")
 _NO_SPACE_AFTER = set("([{\u201c\u2018")
 _NUMERIC_JOINERS = set(",.:/")
 _UNIT_SUFFIXES = {
-    "%",
-    "k",
-    "m",
-    "b",
-    "t",
-    "mm",
-    "cm",
-    "km",
-    "kg",
-    "g",
-    "mg",
-    "lb",
-    "lbs",
-    "oz",
-    "s",
-    "ms",
-    "hz",
-    "khz",
-    "mhz",
-    "ghz",
-    "w",
-    "kw",
-    "mw",
-    "kb",
-    "mb",
-    "gb",
-    "tb",
-    "°",
-    "°c",
-    "°f",
+    "%", "k", "m", "b", "t", "mm", "cm", "km", "kg", "g", "mg",
+    "lb", "lbs", "oz", "s", "ms", "hz", "khz", "mhz", "ghz", "w",
+    "kw", "mw", "kb", "mb", "gb", "tb", "°", "°c", "°f",
 }
 
 
@@ -182,6 +155,8 @@ def _attach_to_previous(previous, current, had_leading_space):
         return True
     if previous_last.isdigit() and _is_unit_suffix(current):
         return True
+    if not had_leading_space and previous_last.isdigit() and current_first.isdigit():
+        return True
     if not had_leading_space and previous_last.isdigit() and current_first.isalpha():
         return len(current) <= 4
     if not had_leading_space and previous_last.isalpha() and current_first.isdigit():
@@ -194,14 +169,12 @@ def _attach_to_previous(previous, current, had_leading_space):
     return False
 
 
-def _token_spacing(previous, current, had_leading_space=False):
+def _token_spacing(previous, current, had_leading_space=False, continuation=False):
     if not previous:
         return ""
     if _attach_to_previous(previous, current, had_leading_space):
         return ""
-    if had_leading_space:
-        return " "
-    return " "
+    return "" if continuation else " "
 
 
 def _clean_raw_token(raw):
@@ -217,10 +190,12 @@ def _display_tokens(words):
 
     display = []
     previous = ""
+    bpe_spacing = any(str(word).startswith(("Ġ", "▁", " ")) for word in words)
 
     for raw in words:
         token = _clean_raw_token(raw)
         if token == "":
+            display.append("")
             continue
 
         newline_prefix = token[: len(token) - len(token.lstrip("\n"))]
@@ -233,20 +208,26 @@ def _display_tokens(words):
                 visible = newline_prefix + body
             else:
                 visible = newline_prefix
-        elif not display:
+        elif not previous:
             visible = body
         else:
-            visible = _token_spacing(previous, body, had_leading_space) + body
+            continuation = not had_leading_space and (
+                bpe_spacing or str(raw).startswith("##")
+            )
+            visible = _token_spacing(previous, body, had_leading_space, continuation) + body
 
         if visible == "":
+            display.append("")
             continue
 
         display.append(visible)
         if body:
-            if _attach_to_previous(previous, body, had_leading_space):
+            if not visible.startswith((" ", "\n")):
                 previous = previous.rstrip() + body
             else:
                 previous = body
+        elif newline_prefix:
+            previous = ""
 
     return display
 
@@ -740,13 +721,47 @@ def _rgba_css(relevance, cmap, alpha=0.65):
     return f"rgba({r},{g},{b},{alpha})"
 
 
-def _layout_plotly_lines(spans, max_line_units):
+def _plotly_font(font_family, fontsize):
+    """Find the font used by Plotly so token boxes follow glyph advances."""
+
+    try:
+        from PIL import ImageFont
+    except ImportError:
+        return None
+
+    if shutil.which("fc-match") is None:
+        return None
+
+    preferred_family = font_family.split(",")[0].strip()
+    result = subprocess.run(
+        ["fc-match", "-f", "%{file}", preferred_family],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        return ImageFont.truetype(result.stdout.strip(), max(1, round(fontsize)))
+    except OSError:
+        return None
+
+
+def _plotly_text_width(text, font):
+    if font is not None:
+        return font.getlength(text) / font.size
+    return len(text) * 0.55
+
+
+def _layout_plotly_lines(spans, max_line_units, font):
+    """Wrap at word boundaries while keeping each token's own highlight."""
+
     lines = []
     current = []
     current_width = 0.0
     current_gaps = 0
+    space_width = _plotly_text_width(" ", font)
 
-    for span in spans:
+    for index, span in enumerate(spans):
         if span["newline_count"]:
             if current:
                 lines.append(
@@ -765,23 +780,30 @@ def _layout_plotly_lines(spans, max_line_units):
         if not span["text"]:
             continue
 
-        box_width = max(1.4, len(span["text"]) * 0.62 + 0.75)
-        starts_with_space = bool(current and span["leading_space"])
-        next_width = current_width + box_width
-        if current and next_width > max_line_units:
-            lines.append(
-                {
-                    "items": current,
-                    "width": current_width,
-                    "gaps": current_gaps,
-                    "forced": False,
-                }
-            )
-            current = []
-            current_width = 0.0
-            current_gaps = 0
-            starts_with_space = False
+        if span["leading_space"] and current:
+            word_width = 0.0
+            for next_index in range(index, len(spans)):
+                next_span = spans[next_index]
+                if next_index > index and (
+                    next_span["leading_space"] or next_span["newline_count"]
+                ):
+                    break
+                word_width += _plotly_text_width(next_span["text"], font)
+            if current_width + space_width + word_width > max_line_units:
+                lines.append(
+                    {
+                        "items": current,
+                        "width": current_width,
+                        "gaps": current_gaps,
+                        "forced": False,
+                    }
+                )
+                current = []
+                current_width = 0.0
+                current_gaps = 0
 
+        starts_with_space = bool(current and span["leading_space"])
+        box_width = _plotly_text_width(span["text"], font)
         current.append(
             {
                 "span": span,
@@ -789,7 +811,7 @@ def _layout_plotly_lines(spans, max_line_units):
                 "starts_with_space": starts_with_space,
             }
         )
-        current_width += box_width
+        current_width += box_width + (space_width if starts_with_space else 0.0)
         if starts_with_space:
             current_gaps += 1
 
@@ -802,7 +824,7 @@ def _layout_plotly_lines(spans, max_line_units):
                 "forced": False,
             }
         )
-    return lines
+    return lines, space_width
 
 
 def interactive_text_heatmap(
@@ -819,7 +841,7 @@ def interactive_text_heatmap(
     font_family="Latin Modern Roman, Computer Modern, Times New Roman, Times, serif",
     box_alpha=0.65,
 ):
-    """Create a Plotly text heatmap with colored hoverable token boxes."""
+    """Create a Plotly text heatmap with colored, hoverable token boxes."""
 
     try:
         import plotly.graph_objects as go
@@ -828,13 +850,18 @@ def interactive_text_heatmap(
 
     words, relevances = _prepare_inputs(words, relevances, normalize=normalize)
     spans = _display_spans(words, relevances)
-    lines = _layout_plotly_lines(spans, max_line_units=max_line_units)
+    font = _plotly_font(font_family, fontsize)
+    available_units = max(1.0, (width - 4) / fontsize)
+    line_units = min(max_line_units, available_units)
+    lines, space_width = _layout_plotly_lines(spans, line_units, font)
 
     fig = go.Figure()
     annotations = []
     x_extent = 0.0
-    row_height = 1.25
-    box_height = 0.82
+    line_pixels = max(34, 2.2 * fontsize)
+    row_height = line_pixels / fontsize
+    box_height = 1.45
+    figure_height = max(80, 18 + max(1, len(lines)) * line_pixels)
 
     for line_index, line in enumerate(lines):
         y_center = -line_index * row_height
@@ -844,7 +871,7 @@ def interactive_text_heatmap(
         is_last_line = line_index == len(lines) - 1 or line["forced"]
         gap = 0.0
         if justify and line["gaps"] and (justify_last or not is_last_line):
-            requested_gap = max(0.0, (max_line_units - line["width"]) / line["gaps"])
+            requested_gap = max(0.0, (line_units - line["width"]) / line["gaps"])
             gap = (
                 requested_gap
                 if max_justify_gap is None
@@ -854,7 +881,7 @@ def interactive_text_heatmap(
         x = 0.0
         for item in items:
             if item["starts_with_space"]:
-                x += gap
+                x += space_width + gap
             span = item["span"]
             box_width = item["box_width"]
             x0 = x
@@ -890,11 +917,10 @@ def interactive_text_heatmap(
             x = x1
             x_extent = max(x_extent, x1)
 
-    x_range_end = max(1.0, min(max_line_units, x_extent))
-
+    x_range_end = max(available_units, x_extent)
     fig.update_layout(
         width=width,
-        height=max(80, 18 + max(1, len(lines)) * 34),
+        height=figure_height,
         margin={"l": 2, "r": 2, "t": 2, "b": 2},
         plot_bgcolor="white",
         paper_bgcolor="white",
@@ -902,7 +928,7 @@ def interactive_text_heatmap(
         xaxis={"visible": False, "range": [0, x_range_end], "fixedrange": True},
         yaxis={
             "visible": False,
-            "range": [-max(1, len(lines)) * row_height + 0.45, 0.45],
+            "range": [1.1 - (figure_height - 4) / fontsize, 1.1],
             "fixedrange": True,
         },
         hoverlabel={"bgcolor": "white", "font_size": 13},
